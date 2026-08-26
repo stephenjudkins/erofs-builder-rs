@@ -5,7 +5,7 @@ A simple library to build [EROFS](https://docs.kernel.org/filesystems/erofs.html
 ## Usage
 
 ```rust
-use erofs_rs::{CreateOptions, InodeMeta, Writer};
+use erofs_builder::{CreateOptions, InodeMeta, Writer};
 
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
