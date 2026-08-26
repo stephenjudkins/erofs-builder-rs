@@ -63,12 +63,17 @@ pub enum FileType {
 
 impl FileType {
     pub fn from_u8(v: u8) -> Option<Self> {
-        if v > 7 {
-            None
-        } else {
-            // SAFETY: FileType is repr(u8) with all variants 0..=7.
-            Some(unsafe { std::mem::transmute(v) })
-        }
+        Some(match v {
+            0 => FileType::Unknown,
+            1 => FileType::RegFile,
+            2 => FileType::Dir,
+            3 => FileType::Chrdev,
+            4 => FileType::Blkdev,
+            5 => FileType::Fifo,
+            6 => FileType::Sock,
+            7 => FileType::Symlink,
+            _ => return None,
+        })
     }
 }
 

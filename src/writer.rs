@@ -746,7 +746,8 @@ fn write_superblock(area: &mut [u8], p: SuperblockParams) {
     sb[84..86].copy_from_slice(&0u16.to_le_bytes()); // available_compr_algs
     sb[86..88].copy_from_slice(&0u16.to_le_bytes()); // extra_devices
     sb[88..90].copy_from_slice(&0u16.to_le_bytes()); // devt_slotoff
-    sb[90] = p.bits; // dirblkbits
+                                                     // dirblkbits stays 0: kernels <= 6.18 reject any nonzero value, and
+                                                     // block-sized directory blocks are the default anyway
 
     area[EROFS_SUPER_OFFSET..EROFS_SUPER_OFFSET + SIZE_SUPER_BLOCK].copy_from_slice(&sb);
 
