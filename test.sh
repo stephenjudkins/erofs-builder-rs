@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build erofs-rs, create a test image with the sample binary,
+# Build erofs-builder, create a test image with the sample binary,
 # and verify it with fsck.erofs / dump.erofs from nixpkgs erofs-utils.
 set -euo pipefail
 
@@ -29,13 +29,13 @@ echo "==> dump.erofs on fixture image"
 $ERFS dump.erofs -s $IMAGE || fail "dump.erofs failed on fixture image"
 
 echo "==> extracting fixture and comparing content"
-EXTRACT=erofs-rs-extract
+EXTRACT=erofs-builder-extract
 mkdir -p $EXTRACT
 
 trap 'rm -rf "$IMAGE" "$TREE" "$EXTRACT" "$TAR"' EXIT
 $ERFS fsck.erofs --extract=$EXTRACT $IMAGE || fail "extraction failed"
 
-[ "$(cat "$EXTRACT/etc/motd")" = "hello from erofs-rs" ] || fail "/etc/motd content mismatch"
+[ "$(cat "$EXTRACT/etc/motd")" = "hello from erofs-builder" ] || fail "/etc/motd content mismatch"
 [ -L "$EXTRACT/link" ] && [ "$(readlink "$EXTRACT/link")" = "etc/motd" ] || fail "/link symlink mismatch"
 if [ "$(id -u)" = "0" ]; then
   [ -c "$EXTRACT/zero" ] || fail "/zero is not a char device"

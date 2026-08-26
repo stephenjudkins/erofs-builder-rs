@@ -1,6 +1,6 @@
 use clap::{Parser, ValueEnum};
-use erofs_rs::layout::mode;
-use erofs_rs::{CreateOptions, InodeMeta, Writer};
+use erofs_builder::layout::mode;
+use erofs_builder::{CreateOptions, InodeMeta, Writer};
 use tokio::io::{AsyncReadExt, BufWriter};
 
 #[derive(Copy, Clone, PartialEq, Eq, ValueEnum, Debug)]
@@ -43,7 +43,7 @@ async fn main() -> std::io::Result<()> {
         build_time: args.build_time,
         build_time_nsec: 0,
         uuid: *uuid_from_seed(args.build_time),
-        volume_name: "erofs-rs".into(),
+        volume_name: "erofs-builder".into(),
         checksum: args.checksum,
     };
     let file = tokio::fs::File::create(&args.output).await?;
@@ -101,8 +101,8 @@ async fn build_fixture(w: &mut ImageWriter) -> std::io::Result<()> {
     };
     motd_meta
         .xattrs
-        .insert("trusted.origin".to_string(), b"erofs-rs".to_vec());
-    let motd = b"hello from erofs-rs\n";
+        .insert("trusted.origin".to_string(), b"erofs-builder".to_vec());
+    let motd = b"hello from erofs-builder\n";
     let mut motd_cur = std::io::Cursor::new(motd);
     w.add_file("/etc/motd", motd_meta, motd.len() as u64, &mut motd_cur)
         .await?;

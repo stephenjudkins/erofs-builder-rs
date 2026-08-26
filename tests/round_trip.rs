@@ -4,9 +4,9 @@
 use std::collections::HashMap;
 use std::io::Cursor;
 
-use erofs_rs::layout::mode;
-use erofs_rs::layout::{EROFS_SUPER_MAGIC_V1, EROFS_SUPER_OFFSET};
-use erofs_rs::{CreateOptions, InodeMeta, Writer};
+use erofs_builder::layout::mode;
+use erofs_builder::layout::{EROFS_SUPER_MAGIC_V1, EROFS_SUPER_OFFSET};
+use erofs_builder::{CreateOptions, InodeMeta, Writer};
 
 const BS: usize = 4096;
 
@@ -233,7 +233,7 @@ async fn checksum_feature_bit() {
     let sb = EROFS_SUPER_OFFSET;
     assert_eq!(
         le32(&img, sb + 8),
-        erofs_rs::layout::EROFS_FEATURE_COMPAT_SB_CHKSUM
+        erofs_builder::layout::EROFS_FEATURE_COMPAT_SB_CHKSUM
     );
     assert_ne!(le32(&img, sb + 4), 0, "crc32c field is set");
 }
