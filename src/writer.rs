@@ -1,15 +1,16 @@
-//! The EROFS image writer: in-memory tree, layout planning, serialization.
+//! The EROFS image writer: incremental single-pass streaming layout.
 
 use std::collections::{HashMap, HashSet};
-use std::future::Future;
 use std::io;
 
 use crate::layout::*;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeek, AsyncSeekExt, AsyncWrite, AsyncWriteExt};
 
 pub const DEFAULT_BLOCK_SIZE: usize = 4096;
 pub const MIN_BLOCK_SIZE: usize = 512;
 pub const MAX_BLOCK_SIZE: usize = 1 << 16;
+
+const ZEROS: [u8; MAX_BLOCK_SIZE] = [0u8; MAX_BLOCK_SIZE];
 
 /// Metadata for a filesystem entry, mirroring `stat` plus EROFS extras.
 #[derive(Clone, Debug)]
@@ -66,9 +67,13 @@ impl InodeMeta {
 
 enum Content {
     Empty,
+    /// Held in memory because it may still qualify for inline storage.
     Inline(Vec<u8>),
-    Stream(Box<dyn AsyncRead + Send + Sync + Unpin>),
-    Drained(Vec<u8>),
+    /// Already written to the sink as block-aligned data; the start block
+    /// is kept in `Node::data_blkaddr`.
+    Streamed {
+        len: u64,
+    },
 }
 
 struct Node {
@@ -134,8 +139,9 @@ impl Node {
     fn on_disk_size(&self) -> u64 {
         match self.file_type {
             FileType::RegFile | FileType::Unknown => match self.content {
-                Content::Inline(ref d) | Content::Drained(ref d) => d.len() as u64,
-                _ => 0,
+                Content::Empty => 0,
+                Content::Inline(ref d) => d.len() as u64,
+                Content::Streamed { len } => len,
             },
             FileType::Symlink => self.link_target.len() as u64,
             _ => 0,
@@ -214,14 +220,22 @@ impl Default for CreateOptions {
     }
 }
 
-/// Builder for an EROFS image. Entries are added to an in-memory tree and
-/// the full image is serialized on [`Builder::finish`].
+/// Single-pass streaming EROFS image writer.
 ///
-/// Regular-file content is supplied as an [`tokio::io::AsyncRead`] and
-/// pulled lazily
-/// during finalization, so arbitrarily large files stream through with
-/// bounded memory use.
-pub struct Builder {
+/// File data is written to the sink as it is added; [`Writer::finish`]
+/// appends the metadata area and patches the superblock in place via a
+/// seek back to offset 0, so the sink must implement both
+/// [`tokio::io::AsyncWrite`] and [`tokio::io::AsyncSeek`] (e.g.
+/// [`tokio::fs::File`], `tokio::io::BufWriter<File>`, or
+/// `std::io::Cursor<Vec<u8>>` for in-memory images).
+///
+/// Regular-file content is pushed with a declared size, which keeps memory
+/// bounded and allows sources that can only be read once (such as a tar
+/// archive being consumed as it streams past) to be packed in a single
+/// pass. Files no larger than the block size are buffered in memory since
+/// they may end up inlined into their inode.
+pub struct Writer<W> {
+    sink: W,
     root: Node,
     build_time: u64,
     build_time_nsec: u32,
@@ -230,10 +244,15 @@ pub struct Builder {
     volume_name: String,
     checksum: bool,
     paths: HashSet<String>,
+    /// Next free block in the data area (absolute block index).
+    data_end: u32,
 }
 
-impl Builder {
-    pub fn new(opts: CreateOptions) -> io::Result<Self> {
+impl<W> Writer<W>
+where
+    W: AsyncWrite + AsyncSeek + Unpin + Send,
+{
+    pub async fn new(sink: W, opts: CreateOptions) -> io::Result<Self> {
         if opts.block_size < MIN_BLOCK_SIZE
             || opts.block_size > MAX_BLOCK_SIZE
             || !opts.block_size.is_power_of_two()
@@ -252,7 +271,11 @@ impl Builder {
                 "volume name longer than 16 bytes",
             ));
         }
+        let mut sink = sink;
+        let sb_area_bytes = round_up(EROFS_SUPER_OFFSET + SIZE_SUPER_BLOCK, opts.block_size);
+        sink.write_all(&vec![0u8; sb_area_bytes]).await?;
         Ok(Self {
+            sink,
             root: Node::new(String::new(), InodeMeta::dir(0o755)),
             build_time: opts.build_time,
             build_time_nsec: opts.build_time_nsec,
@@ -261,346 +284,179 @@ impl Builder {
             volume_name: opts.volume_name,
             checksum: opts.checksum,
             paths: ["/".to_string()].into_iter().collect(),
+            data_end: (sb_area_bytes / opts.block_size) as u32,
         })
     }
 
-    fn clean(path: &str) -> String {
-        let p = path.trim_start_matches('/');
-        let mut parts: Vec<&str> = Vec::new();
-        for seg in p.split('/') {
-            match seg {
-                "" | "." => {}
-                ".." => {
-                    parts.pop();
-                }
-                _ => parts.push(seg),
-            }
-        }
-        parts.join("/")
-    }
-
-    fn ensure_dir(&mut self, clean: &str) -> io::Result<()> {
+    /// Add a regular file, reading exactly `size` bytes from `data` and
+    /// writing them to the sink immediately. Errors if `data` runs short.
+    pub async fn add_file<R>(
+        &mut self,
+        path: &str,
+        meta: InodeMeta,
+        size: u64,
+        data: &mut R,
+    ) -> io::Result<()>
+    where
+        R: AsyncRead + Unpin,
+    {
+        let clean = clean(path);
         if clean.is_empty() {
-            return Ok(());
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid path"));
         }
-        // Only materialize parent directories; the final segment is created
-        // by `insert` with the caller-supplied metadata.
-        let parent = match clean.rfind('/') {
-            Some(i) => &clean[..i],
-            None => return Ok(()),
+        ensure_dir(&mut self.root, &mut self.paths, &clean)?;
+        let mut node = Node::new(String::new(), meta);
+        node.content = if size == 0 {
+            Content::Empty
+        } else if size <= self.block_size as u64 {
+            let mut buf = vec![0u8; size as usize];
+            data.read_exact(&mut buf).await?;
+            Content::Inline(buf)
+        } else {
+            node.data_blkaddr = self.stream_data(size, data).await?;
+            Content::Streamed { len: size }
         };
-        let mut cur = String::new();
-        for seg in parent.split('/').filter(|s| !s.is_empty()) {
-            if !cur.is_empty() {
-                cur.push('/');
-            }
-            cur.push_str(seg);
-            if self.paths.contains(&format!("/{}", cur)) {
-                continue;
-            }
-            let node = Node::new(seg.to_string(), InodeMeta::dir(0o755));
-            self.insert(&cur, node)?;
-        }
-        Ok(())
+        insert(&mut self.root, &mut self.paths, &clean, node)
     }
 
-    fn insert(&mut self, clean: &str, mut node: Node) -> io::Result<()> {
-        let (parent, name) = match clean.rfind('/') {
-            Some(i) => (&clean[..i], &clean[i + 1..]),
-            None => ("", clean),
-        };
-        let mut dir = &mut self.root;
-        for seg in parent.split('/').filter(|s| !s.is_empty()) {
-            dir = dir
-                .children
-                .iter_mut()
-                .find(|c| c.is_dir() && c.name == seg)
-                .ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::NotFound, "missing parent directory")
-                })?;
-        }
-        if dir.children.iter().any(|c| c.name == name) {
-            if self.paths.contains(&format!("/{}", clean)) {
-                return Ok(());
-            }
+    async fn stream_data<R>(&mut self, size: u64, data: &mut R) -> io::Result<u32>
+    where
+        R: AsyncRead + Unpin,
+    {
+        let bs = self.block_size as u64;
+        let blocks = size.div_ceil(bs);
+        if self.data_end as u64 + blocks > u32::MAX as u64 {
             return Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                format!("duplicate path /{}", clean),
+                io::ErrorKind::FileTooLarge,
+                "image too large",
             ));
         }
-        node.name = name.to_string();
-        dir.children.push(node);
-        self.paths.insert(format!("/{}", clean));
-        Ok(())
+        let start = self.data_end;
+        let start_pos = start as u64 * self.block_size as u64;
+
+        let res = async {
+            let mut chunk = vec![0u8; 64 * 1024];
+            let mut remaining = size;
+            while remaining > 0 {
+                let n = chunk.len().min(remaining as usize);
+                data.read_exact(&mut chunk[..n]).await?;
+                self.sink.write_all(&chunk[..n]).await?;
+                remaining -= n as u64;
+            }
+            Ok::<(), io::Error>(())
+        }
+        .await;
+
+        match res {
+            Ok(()) => {
+                let pad = (blocks * bs - size) as usize;
+                if pad > 0 {
+                    self.sink.write_all(&ZEROS[..pad]).await?;
+                }
+                self.data_end = start + blocks as u32;
+                Ok(start)
+            }
+            Err(e) => {
+                // Rewind so a subsequent add_file overwrites the partial data.
+                let _ = self.sink.seek(io::SeekFrom::Start(start_pos)).await;
+                Err(e)
+            }
+        }
     }
 
     /// Add a directory. Intermediate directories are created implicitly.
     pub async fn mkdir(&mut self, path: &str, meta: InodeMeta) -> io::Result<()> {
-        let clean = Self::clean(path);
+        let clean = clean(path);
         if clean.is_empty() {
             self.root.meta = meta;
             return Ok(());
         }
-        self.ensure_dir(&clean)?;
-        self.insert(&clean, Node::new(String::new(), meta))
-    }
-
-    /// Add a regular file whose content is read from `data`.
-    pub async fn add_file<R>(&mut self, path: &str, meta: InodeMeta, data: R) -> io::Result<()>
-    where
-        R: AsyncRead + Send + Sync + Unpin + 'static,
-    {
-        let clean = Self::clean(path);
-        if clean.is_empty() {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid path"));
-        }
-        self.ensure_dir(&clean)?;
-        let mut node = Node::new(String::new(), meta);
-        node.content = Content::Stream(Box::new(data));
-        self.insert(&clean, node)
-    }
-
-    /// Add an in-memory blob as a regular file.
-    pub async fn add_bytes(
-        &mut self,
-        path: &str,
-        meta: InodeMeta,
-        data: Vec<u8>,
-    ) -> io::Result<()> {
-        let clean = Self::clean(path);
-        if clean.is_empty() {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid path"));
-        }
-        self.ensure_dir(&clean)?;
-        let mut node = Node::new(String::new(), meta);
-        node.content = if data.is_empty() {
-            Content::Empty
-        } else {
-            Content::Inline(data)
-        };
-        self.insert(&clean, node)
+        ensure_dir(&mut self.root, &mut self.paths, &clean)?;
+        insert(
+            &mut self.root,
+            &mut self.paths,
+            &clean,
+            Node::new(String::new(), meta),
+        )
     }
 
     /// Add a symlink.
     pub async fn symlink(&mut self, path: &str, target: &[u8], meta: InodeMeta) -> io::Result<()> {
-        let clean = Self::clean(path);
+        let clean = clean(path);
         if clean.is_empty() {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid path"));
         }
-        self.ensure_dir(&clean)?;
+        ensure_dir(&mut self.root, &mut self.paths, &clean)?;
         let mut node = Node::new(String::new(), meta);
         node.link_target = target.to_vec();
-        self.insert(&clean, node)
+        insert(&mut self.root, &mut self.paths, &clean, node)
     }
 
     /// Add a device node, FIFO or socket (`meta.mode` carries the type).
     pub async fn mknod(&mut self, path: &str, meta: InodeMeta) -> io::Result<()> {
-        let clean = Self::clean(path);
+        let clean = clean(path);
         if clean.is_empty() {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid path"));
         }
-        self.ensure_dir(&clean)?;
-        self.insert(&clean, Node::new(String::new(), meta))
+        ensure_dir(&mut self.root, &mut self.paths, &clean)?;
+        insert(
+            &mut self.root,
+            &mut self.paths,
+            &clean,
+            Node::new(String::new(), meta),
+        )
     }
 
-    /// Read all streamed file contents into memory-backed buffers, exactly
-    /// once, during finalization.
-    async fn drain_streams(node: &mut Node) -> io::Result<()> {
-        if let Content::Stream(_) = node.content {
-            let mut stream = match std::mem::replace(&mut node.content, Content::Empty) {
-                Content::Stream(s) => s,
-                _ => unreachable!(),
-            };
-            let mut buf = Vec::new();
-            stream.read_to_end(&mut buf).await?;
-            node.content = Content::Drained(buf);
-        }
-        for c in node.children.iter_mut() {
-            Box::pin(Self::drain_streams(c)).await?;
-        }
-        Ok(())
-    }
-
-    fn plan_layout(&mut self) {
+    /// Lay out metadata, append outstanding data (dirent blocks, fallback
+    /// file blocks, non-inline symlink targets) and the metadata area, then
+    /// patch the superblock and return the sink.
+    pub async fn finish(mut self) -> io::Result<W> {
         let bs = self.block_size;
-        let bt = self.build_time;
-        let btn = self.build_time_nsec;
-
-        fn plan_node(n: &mut Node, off: &mut usize, bs: usize, bt: u64, btn: u32) {
-            n.xattr_size = calc_xattr_size(&n.meta.xattrs);
-            n.compact = n.meta.uid <= 0xFFFF
-                && n.meta.gid <= 0xFFFF
-                && n.effective_nlink() <= 0xFFFF
-                && n.on_disk_size() <= u32::MAX as u64
-                && n.meta.mtime == bt
-                && n.meta.mtime_nsec == btn;
-
-            let inode_size = if n.compact {
-                SIZE_INODE_COMPACT
-            } else {
-                SIZE_INODE_EXTENDED
-            };
-            let header_size = inode_size + n.xattr_size;
-
-            match n.file_type {
-                FileType::RegFile => {
-                    n.layout = match &n.content {
-                        Content::Empty => DataLayout::FlatPlain,
-                        Content::Inline(ref d) | Content::Drained(ref d) => {
-                            if d.is_empty() {
-                                DataLayout::FlatPlain
-                            } else {
-                                let in_block_off = (*off + header_size) % bs;
-                                if in_block_off + d.len() <= bs {
-                                    DataLayout::FlatInline
-                                } else {
-                                    DataLayout::FlatPlain
-                                }
-                            }
-                        }
-                        Content::Stream(_) => DataLayout::FlatPlain,
-                    };
-                }
-                FileType::Symlink => {
-                    let in_block_off = (*off + header_size) % bs;
-                    n.layout =
-                        if !n.link_target.is_empty() && in_block_off + n.link_target.len() <= bs {
-                            DataLayout::FlatInline
-                        } else {
-                            DataLayout::FlatPlain
-                        };
-                }
-                FileType::Dir => {
-                    let ds = dirent_data_size(n, bs);
-                    let in_block_off = (*off + header_size) % bs;
-                    n.layout = if ds > 0 && in_block_off + ds <= bs {
-                        DataLayout::FlatInline
-                    } else {
-                        DataLayout::FlatPlain
-                    };
-                }
-                _ => n.layout = DataLayout::FlatPlain,
-            }
-
-            n.trailing_size = calc_trailing_size(n, bs);
-
-            // Inode core must not cross a block boundary.
-            if *off % bs + inode_size > bs {
-                *off = round_up(*off, bs);
-            }
-            n.nid = (*off / 32) as u64;
-
-            // Inline data must not cross a block boundary either.
-            if n.layout == DataLayout::FlatInline {
-                let block_off = *off % bs;
-                if block_off + header_size + n.trailing_size > bs {
-                    n.layout = DataLayout::FlatPlain;
-                    n.trailing_size = calc_trailing_size(n, bs);
-                }
-            }
-
-            let total = round_up(header_size + n.trailing_size, 32);
-            *off += total;
-
-            for c in n.children.iter_mut() {
-                plan_node(c, off, bs, bt, btn);
-            }
-        }
-
-        // Root inode lives at offset 0.
-        let mut off;
-        {
-            let n = &mut self.root;
-            n.nid = 0;
-            n.xattr_size = calc_xattr_size(&n.meta.xattrs);
-            n.compact = n.meta.uid <= 0xFFFF
-                && n.meta.gid <= 0xFFFF
-                && n.effective_nlink() <= 0xFFFF
-                && n.on_disk_size() <= u32::MAX as u64
-                && n.meta.mtime == bt
-                && n.meta.mtime_nsec == btn;
-            let inode_size = if n.compact {
-                SIZE_INODE_COMPACT
-            } else {
-                SIZE_INODE_EXTENDED
-            };
-            let header_size = inode_size + n.xattr_size;
-            let ds = dirent_data_size(n, bs);
-            let in_block_off = header_size % bs;
-            n.layout = if ds > 0 && in_block_off + ds <= bs {
-                DataLayout::FlatInline
-            } else {
-                DataLayout::FlatPlain
-            };
-            n.trailing_size = calc_trailing_size(n, bs);
-            off = round_up(header_size + n.trailing_size, 32);
-        }
-        for i in 0..self.root.children.len() {
-            plan_node(&mut self.root.children[i], &mut off, bs, bt, btn);
-        }
-
-        assign_parent_nids(&mut self.root, 0);
-    }
-
-    fn collect_entries(&self) -> Vec<&Node> {
-        let mut out = Vec::new();
-        fn rec<'a>(n: &'a Node, out: &mut Vec<&'a Node>) {
-            out.push(n);
-            for c in &n.children {
-                rec(c, out);
-            }
-        }
-        rec(&self.root, &mut out);
-        out
-    }
-
-    /// Serialize the whole image into `sink`.
-    pub async fn finish<W>(self, sink: &mut W) -> io::Result<()>
-    where
-        W: AsyncWrite + Send + Unpin,
-    {
-        let mut this = self;
-        let sink = sink;
-
-        {
-            let children = std::mem::take(&mut this.root.children);
-            let mut children = children;
-            for c in children.iter_mut() {
-                Self::drain_streams(c).await?;
-            }
-            this.root.children = children;
-        }
-
-        this.plan_layout();
-
-        let bs = this.block_size;
         let bits = blk_bits(bs);
 
-        let entries = this.collect_entries();
+        plan_layout(&mut self.root, bs, self.build_time, self.build_time_nsec);
+
+        let entries = collect_entries(&self.root);
         let total_inodes = entries.len() as u64;
 
-        let sb_area_bytes = round_up(EROFS_SUPER_OFFSET + SIZE_SUPER_BLOCK, bs);
-
-        // Assign data blocks: data-first layout (sb area, data..., metadata).
-        let mut addr = (sb_area_bytes / bs) as u32;
+        // Nids are final now; fold the streamed blocks into the addr map.
         let mut data_addrs: HashMap<u64, u32> = HashMap::new();
         for e in &entries {
-            let needs_data = match e.file_type {
+            if let Content::Streamed { .. } = e.content {
+                data_addrs.insert(e.nid, e.data_blkaddr);
+            }
+        }
+
+        // Fallback data pass: everything that could not be inlined.
+        let mut addr = self.data_end;
+        let mut stack: Vec<&Node> = vec![&self.root];
+        while let Some(n) = stack.pop() {
+            let needs_data = match n.file_type {
                 FileType::RegFile => {
-                    e.layout == DataLayout::FlatPlain
-                        && matches!(
-                            e.content,
-                            Content::Inline(ref d) | Content::Drained(ref d) if !d.is_empty()
-                        )
+                    n.layout == DataLayout::FlatPlain
+                        && matches!(&n.content, Content::Inline(d) if !d.is_empty())
                 }
-                FileType::Dir => e.layout == DataLayout::FlatPlain,
-                FileType::Symlink => e.layout == DataLayout::FlatPlain && !e.link_target.is_empty(),
+                FileType::Dir => n.layout == DataLayout::FlatPlain,
+                FileType::Symlink => n.layout == DataLayout::FlatPlain && !n.link_target.is_empty(),
                 _ => false,
             };
             if needs_data {
-                data_addrs.insert(e.nid, addr);
-                let ds = flat_plain_data_size(e);
-                addr += ds.div_ceil(bs) as u32;
+                let mut buf = match n.file_type {
+                    FileType::Dir => build_dirents(n, bs),
+                    FileType::Symlink => n.link_target.clone(),
+                    FileType::RegFile => match &n.content {
+                        Content::Inline(d) => d.clone(),
+                        _ => unreachable!(),
+                    },
+                    _ => unreachable!(),
+                };
+                pad_to_block(&mut buf, bs);
+                data_addrs.insert(n.nid, addr);
+                addr += (buf.len() / bs) as u32;
+                self.sink.write_all(&buf).await?;
+            }
+            for c in n.children.iter().rev() {
+                stack.push(c);
             }
         }
         let meta_blkaddr = addr;
@@ -623,43 +479,238 @@ impl Builder {
         let meta_blocks = meta_bytes.div_ceil(bs);
         let total_blocks = meta_blkaddr as usize + meta_blocks;
 
-        // All sizes are known up front, so build the real superblock now and
-        // emit [sb area][data][metadata] strictly sequentially.
+        // Metadata area.
+        let mut meta_buf: Vec<u8> = Vec::with_capacity(meta_bytes);
+        write_metadata(&self.root, &mut meta_buf, &data_addrs, bs)?;
+        debug_assert_eq!(meta_buf.len(), meta_bytes, "metadata size mismatch");
+        meta_buf.resize(meta_blocks * bs, 0);
+        self.sink.write_all(&meta_buf).await?;
+
+        // Patch the superblock over its placeholder.
+        let sb_area_bytes = round_up(EROFS_SUPER_OFFSET + SIZE_SUPER_BLOCK, bs);
         let mut sb_area = vec![0u8; sb_area_bytes];
         write_superblock(
             &mut sb_area,
             SuperblockParams {
-                root_nid: this.root.nid,
+                root_nid: self.root.nid,
                 inodes: total_inodes,
-                epoch: this.build_time,
-                fixed_nsec: this.build_time_nsec,
+                epoch: self.build_time,
+                fixed_nsec: self.build_time_nsec,
                 blocks: total_blocks as u32,
                 meta_blkaddr,
                 bits,
-                uuid: &this.uuid,
-                volume_name: &this.volume_name,
-                checksum: this.checksum,
+                uuid: &self.uuid,
+                volume_name: &self.volume_name,
+                checksum: self.checksum,
             },
         );
-        sink.write_all(&sb_area).await?;
-
-        // Data area.
-        {
-            let s: &mut (dyn AsyncWrite + Send + Unpin) = &mut *sink;
-            Box::pin(write_flat_data(&this.root, s, &data_addrs, bs)).await?;
-        }
-
-        // Metadata area.
-        let mut meta_buf: Vec<u8> = Vec::with_capacity(meta_bytes);
-        write_metadata(&this.root, &mut meta_buf, &data_addrs, bs)?;
-        debug_assert_eq!(meta_buf.len(), meta_bytes, "metadata size mismatch");
-        while meta_buf.len() < meta_blocks * bs {
-            meta_buf.push(0);
-        }
-        sink.write_all(&meta_buf).await?;
-
-        sink.flush().await
+        self.sink.seek(io::SeekFrom::Start(0)).await?;
+        self.sink.write_all(&sb_area).await?;
+        self.sink.flush().await?;
+        Ok(self.sink)
     }
+}
+
+fn clean(path: &str) -> String {
+    let p = path.trim_start_matches('/');
+    let mut parts: Vec<&str> = Vec::new();
+    for seg in p.split('/') {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            _ => parts.push(seg),
+        }
+    }
+    parts.join("/")
+}
+
+fn ensure_dir(root: &mut Node, paths: &mut HashSet<String>, clean: &str) -> io::Result<()> {
+    if clean.is_empty() {
+        return Ok(());
+    }
+    // Only materialize parent directories; the final segment is created
+    // by `insert` with the caller-supplied metadata.
+    let parent = match clean.rfind('/') {
+        Some(i) => &clean[..i],
+        None => return Ok(()),
+    };
+    let mut cur = String::new();
+    for seg in parent.split('/').filter(|s| !s.is_empty()) {
+        if !cur.is_empty() {
+            cur.push('/');
+        }
+        cur.push_str(seg);
+        if paths.contains(&format!("/{}", cur)) {
+            continue;
+        }
+        let node = Node::new(seg.to_string(), InodeMeta::dir(0o755));
+        insert(root, paths, &cur, node)?;
+    }
+    Ok(())
+}
+
+fn insert(
+    root: &mut Node,
+    paths: &mut HashSet<String>,
+    clean: &str,
+    mut node: Node,
+) -> io::Result<()> {
+    let (parent, name) = match clean.rfind('/') {
+        Some(i) => (&clean[..i], &clean[i + 1..]),
+        None => ("", clean),
+    };
+    let mut dir = root;
+    for seg in parent.split('/').filter(|s| !s.is_empty()) {
+        dir = dir
+            .children
+            .iter_mut()
+            .find(|c| c.is_dir() && c.name == seg)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "missing parent directory"))?;
+    }
+    if dir.children.iter().any(|c| c.name == name) {
+        if paths.contains(&format!("/{}", clean)) {
+            return Ok(());
+        }
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!("duplicate path /{}", clean),
+        ));
+    }
+    node.name = name.to_string();
+    dir.children.push(node);
+    paths.insert(format!("/{}", clean));
+    Ok(())
+}
+
+fn plan_layout(root: &mut Node, bs: usize, bt: u64, btn: u32) {
+    fn plan_node(n: &mut Node, off: &mut usize, bs: usize, bt: u64, btn: u32) {
+        n.xattr_size = calc_xattr_size(&n.meta.xattrs);
+        n.compact = n.meta.uid <= 0xFFFF
+            && n.meta.gid <= 0xFFFF
+            && n.effective_nlink() <= 0xFFFF
+            && n.on_disk_size() <= u32::MAX as u64
+            && n.meta.mtime == bt
+            && n.meta.mtime_nsec == btn;
+
+        let inode_size = if n.compact {
+            SIZE_INODE_COMPACT
+        } else {
+            SIZE_INODE_EXTENDED
+        };
+        let header_size = inode_size + n.xattr_size;
+
+        match n.file_type {
+            FileType::RegFile => {
+                n.layout = match &n.content {
+                    Content::Empty => DataLayout::FlatPlain,
+                    Content::Streamed { .. } => DataLayout::FlatPlain,
+                    Content::Inline(ref d) => {
+                        if d.is_empty() {
+                            DataLayout::FlatPlain
+                        } else {
+                            let in_block_off = (*off + header_size) % bs;
+                            if in_block_off + d.len() <= bs {
+                                DataLayout::FlatInline
+                            } else {
+                                DataLayout::FlatPlain
+                            }
+                        }
+                    }
+                };
+            }
+            FileType::Symlink => {
+                let in_block_off = (*off + header_size) % bs;
+                n.layout = if !n.link_target.is_empty() && in_block_off + n.link_target.len() <= bs
+                {
+                    DataLayout::FlatInline
+                } else {
+                    DataLayout::FlatPlain
+                };
+            }
+            FileType::Dir => {
+                let ds = dirent_data_size(n, bs);
+                let in_block_off = (*off + header_size) % bs;
+                n.layout = if ds > 0 && in_block_off + ds <= bs {
+                    DataLayout::FlatInline
+                } else {
+                    DataLayout::FlatPlain
+                };
+            }
+            _ => n.layout = DataLayout::FlatPlain,
+        }
+
+        n.trailing_size = calc_trailing_size(n, bs);
+
+        // Inode core must not cross a block boundary.
+        if *off % bs + inode_size > bs {
+            *off = round_up(*off, bs);
+        }
+        n.nid = (*off / 32) as u64;
+
+        // Inline data must not cross a block boundary either.
+        if n.layout == DataLayout::FlatInline {
+            let block_off = *off % bs;
+            if block_off + header_size + n.trailing_size > bs {
+                n.layout = DataLayout::FlatPlain;
+                n.trailing_size = calc_trailing_size(n, bs);
+            }
+        }
+
+        let total = round_up(header_size + n.trailing_size, 32);
+        *off += total;
+
+        for c in n.children.iter_mut() {
+            plan_node(c, off, bs, bt, btn);
+        }
+    }
+
+    // Root inode lives at offset 0.
+    let mut off;
+    {
+        let n = &mut *root;
+        n.nid = 0;
+        n.xattr_size = calc_xattr_size(&n.meta.xattrs);
+        n.compact = n.meta.uid <= 0xFFFF
+            && n.meta.gid <= 0xFFFF
+            && n.effective_nlink() <= 0xFFFF
+            && n.on_disk_size() <= u32::MAX as u64
+            && n.meta.mtime == bt
+            && n.meta.mtime_nsec == btn;
+        let inode_size = if n.compact {
+            SIZE_INODE_COMPACT
+        } else {
+            SIZE_INODE_EXTENDED
+        };
+        let header_size = inode_size + n.xattr_size;
+        let ds = dirent_data_size(n, bs);
+        let in_block_off = header_size % bs;
+        n.layout = if ds > 0 && in_block_off + ds <= bs {
+            DataLayout::FlatInline
+        } else {
+            DataLayout::FlatPlain
+        };
+        n.trailing_size = calc_trailing_size(n, bs);
+        off = round_up(header_size + n.trailing_size, 32);
+    }
+    for i in 0..root.children.len() {
+        plan_node(&mut root.children[i], &mut off, bs, bt, btn);
+    }
+
+    assign_parent_nids(root, 0);
+}
+
+fn collect_entries<'a>(root: &'a Node) -> Vec<&'a Node> {
+    let mut out = Vec::new();
+    fn rec<'a>(n: &'a Node, out: &mut Vec<&'a Node>) {
+        out.push(n);
+        for c in &n.children {
+            rec(c, out);
+        }
+    }
+    rec(root, &mut out);
+    out
 }
 
 struct SuperblockParams<'a> {
@@ -745,19 +796,6 @@ fn calc_trailing_size(n: &Node, bs: usize) -> usize {
     }
 }
 
-fn flat_plain_data_size(n: &Node) -> usize {
-    debug_assert_eq!(n.layout, DataLayout::FlatPlain);
-    match n.file_type {
-        FileType::RegFile => match n.content {
-            Content::Inline(ref d) | Content::Drained(ref d) => d.len(),
-            _ => 0,
-        },
-        FileType::Dir => dirent_data_size(n, DEFAULT_BLOCK_SIZE),
-        FileType::Symlink => n.link_target.len(),
-        _ => 0,
-    }
-}
-
 fn dirent_data_size(n: &Node, block_size: usize) -> usize {
     let mut names: Vec<&str> = vec![".", ".."];
     names.extend(n.children.iter().map(|c| c.name.as_str()));
@@ -800,7 +838,7 @@ fn assign_parent_nids(n: &mut Node, parent_nid: u64) {
     }
 }
 
-fn build_dirents(n: &Node, data_addrs: &HashMap<u64, u32>, block_size: usize) -> Vec<u8> {
+fn build_dirents(n: &Node, block_size: usize) -> Vec<u8> {
     struct De {
         name: String,
         nid: u64,
@@ -831,7 +869,6 @@ fn build_dirents(n: &Node, data_addrs: &HashMap<u64, u32>, block_size: usize) ->
     let mut i = 0;
     while i < all.len() {
         let start = i;
-        let mut used = 0;
         let mut name_size = 0;
         for j in i..all.len() {
             let headers = (j - start + 1) * SIZE_DIRENT;
@@ -840,11 +877,9 @@ fn build_dirents(n: &Node, data_addrs: &HashMap<u64, u32>, block_size: usize) ->
             if needed > block_size {
                 break;
             }
-            used = needed;
             i = j + 1;
         }
         if i == start {
-            used = SIZE_DIRENT + all[i].name.len();
             i += 1;
         }
         let group = &all[start..i];
@@ -869,41 +904,6 @@ fn build_dirents(n: &Node, data_addrs: &HashMap<u64, u32>, block_size: usize) ->
         }
     }
     out
-}
-
-fn write_flat_data<'a>(
-    root: &'a Node,
-    sink: &'a mut (dyn AsyncWrite + Send + Unpin),
-    data_addrs: &'a HashMap<u64, u32>,
-    bs: usize,
-) -> impl Future<Output = io::Result<()>> + Send + 'a {
-    async move {
-        if data_addrs.contains_key(&root.nid) {
-            match root.file_type {
-                FileType::Dir => {
-                    let buf = build_dirents(root, data_addrs, bs);
-                    sink.write_all(&buf).await?;
-                }
-                FileType::Symlink => {
-                    let mut buf = root.link_target.clone();
-                    pad_to_block(&mut buf, bs);
-                    sink.write_all(&buf).await?;
-                }
-                FileType::RegFile => {
-                    if let Content::Inline(ref d) | Content::Drained(ref d) = root.content {
-                        let mut buf = d.clone();
-                        pad_to_block(&mut buf, bs);
-                        sink.write_all(&buf).await?;
-                    }
-                }
-                _ => {}
-            }
-        }
-        for c in &root.children {
-            Box::pin(write_flat_data(c, &mut *sink, data_addrs, bs)).await?;
-        }
-        Ok(())
-    }
 }
 
 fn pad_to_block(buf: &mut Vec<u8>, bs: usize) {
@@ -937,13 +937,13 @@ fn write_metadata(
         if n.layout == DataLayout::FlatInline {
             match n.file_type {
                 FileType::RegFile => {
-                    if let Content::Inline(ref d) | Content::Drained(ref d) = n.content {
+                    if let Content::Inline(ref d) = n.content {
                         buf.extend_from_slice(d);
                     }
                 }
                 FileType::Symlink => buf.extend_from_slice(&n.link_target),
                 FileType::Dir => {
-                    let d = build_dirents(n, data_addrs, bs);
+                    let d = build_dirents(n, bs);
                     buf.extend_from_slice(&d);
                 }
                 _ => {}
