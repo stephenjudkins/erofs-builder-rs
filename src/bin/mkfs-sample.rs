@@ -1,7 +1,5 @@
-use std::pin::Pin;
-
 use clap::{Parser, ValueEnum};
-use erofs_rs::{AsyncReadSource, AsyncWriteSink, Builder, CreateOptions, InodeMeta, StreamSource};
+use erofs_rs::{Builder, CreateOptions, InodeMeta};
 
 #[derive(Copy, Clone, PartialEq, Eq, ValueEnum, Debug)]
 enum Mode {
@@ -54,10 +52,8 @@ async fn main() -> std::io::Result<()> {
         }
     }
 
-    let file = tokio::fs::File::create(&args.output).await?;
-    let sink = AsyncWriteSink::new(file);
-    let mut sink = sink;
-    builder.finish(Pin::new(&mut sink)).await?;
+    let mut file = tokio::fs::File::create(&args.output).await?;
+    builder.finish(&mut file).await?;
     Ok(())
 }
 
@@ -93,11 +89,6 @@ async fn build_fixture(builder: &mut Builder) -> std::io::Result<()> {
 
     // A larger streamed file spanning multiple blocks.
     let big: Vec<u8> = (0..100_000u32).map(|i| (i % 251) as u8).collect();
-    let stream = StreamSource::new(tokio_stream::iter(
-        big.chunks(7777)
-            .map(|c| Ok::<_, std::io::Error>(c.to_vec()))
-            .collect::<Vec<_>>(),
-    ));
     builder
         .add_file(
             "/big.bin",
@@ -105,7 +96,7 @@ async fn build_fixture(builder: &mut Builder) -> std::io::Result<()> {
                 mtime: T,
                 ..InodeMeta::reg(0o600)
             },
-            Box::pin(stream),
+            std::io::Cursor::new(big),
         )
         .await?;
 
@@ -188,13 +179,7 @@ async fn pack_dir(builder: &mut Builder, root: &str) -> std::io::Result<()> {
                     .await?;
             } else if ft.is_file() {
                 let f = tokio::fs::File::open(&child_fs).await?;
-                builder
-                    .add_file(
-                        &child_img,
-                        meta_from(&md),
-                        Box::pin(AsyncReadSource::new(f)),
-                    )
-                    .await?;
+                builder.add_file(&child_img, meta_from(&md), f).await?;
             } else {
                 builder.mknod(&child_img, meta_from(&md)).await?;
             }

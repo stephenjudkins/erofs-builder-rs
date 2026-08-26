@@ -3,12 +3,9 @@
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::io;
-use std::pin::Pin;
-use std::task::{Context, Poll};
 
 use crate::layout::*;
-use futures_core::Stream;
-use futures_sink::Sink;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 pub const DEFAULT_BLOCK_SIZE: usize = 4096;
 pub const MIN_BLOCK_SIZE: usize = 512;
@@ -70,7 +67,7 @@ impl InodeMeta {
 enum Content {
     Empty,
     Inline(Vec<u8>),
-    Stream(Pin<Box<dyn Stream<Item = io::Result<Vec<u8>>> + Send + Sync>>),
+    Stream(Box<dyn AsyncRead + Send + Sync + Unpin>),
     Drained(Vec<u8>),
 }
 
@@ -220,7 +217,8 @@ impl Default for CreateOptions {
 /// Builder for an EROFS image. Entries are added to an in-memory tree and
 /// the full image is serialized on [`Builder::finish`].
 ///
-/// Regular-file content is supplied as a [`Stream`] and pulled lazily
+/// Regular-file content is supplied as an [`tokio::io::AsyncRead`] and
+/// pulled lazily
 /// during finalization, so arbitrarily large files stream through with
 /// bounded memory use.
 pub struct Builder {
@@ -347,20 +345,18 @@ impl Builder {
         self.insert(&clean, Node::new(String::new(), meta))
     }
 
-    /// Add a regular file whose content is streamed from `data`.
-    pub async fn add_file(
-        &mut self,
-        path: &str,
-        meta: InodeMeta,
-        data: Pin<Box<dyn Stream<Item = io::Result<Vec<u8>>> + Send + Sync>>,
-    ) -> io::Result<()> {
+    /// Add a regular file whose content is read from `data`.
+    pub async fn add_file<R>(&mut self, path: &str, meta: InodeMeta, data: R) -> io::Result<()>
+    where
+        R: AsyncRead + Send + Sync + Unpin + 'static,
+    {
         let clean = Self::clean(path);
         if clean.is_empty() {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid path"));
         }
         self.ensure_dir(&clean)?;
         let mut node = Node::new(String::new(), meta);
-        node.content = Content::Stream(data);
+        node.content = Content::Stream(Box::new(data));
         self.insert(&clean, node)
     }
 
@@ -407,30 +403,16 @@ impl Builder {
         self.insert(&clean, Node::new(String::new(), meta))
     }
 
-    /// Drain all streamed file contents into memory-backed buffers.
-    ///
-    /// This is where the sans-IO input side is consumed: each content
-    /// stream is polled to completion exactly once during finalization.
+    /// Read all streamed file contents into memory-backed buffers, exactly
+    /// once, during finalization.
     async fn drain_streams(node: &mut Node) -> io::Result<()> {
         if let Content::Stream(_) = node.content {
-            let mut buf = Vec::new();
             let mut stream = match std::mem::replace(&mut node.content, Content::Empty) {
                 Content::Stream(s) => s,
                 _ => unreachable!(),
             };
-            loop {
-                let waker = std::task::Waker::noop();
-                let mut cx = Context::from_waker(waker);
-                match Stream::poll_next(stream.as_mut(), &mut cx) {
-                    Poll::Ready(Some(chunk)) => {
-                        buf.extend_from_slice(&chunk?);
-                        continue;
-                    }
-                    Poll::Ready(None) => break,
-                    Poll::Pending => {}
-                }
-                pending_then_poll(&mut stream, &mut buf).await?;
-            }
+            let mut buf = Vec::new();
+            stream.read_to_end(&mut buf).await?;
             node.content = Content::Drained(buf);
         }
         for c in node.children.iter_mut() {
@@ -573,12 +555,12 @@ impl Builder {
     }
 
     /// Serialize the whole image into `sink`.
-    pub async fn finish<S: Sink<Vec<u8>, Error = io::Error> + Send>(
-        self,
-        sink: Pin<&mut S>,
-    ) -> io::Result<()> {
+    pub async fn finish<W>(self, sink: &mut W) -> io::Result<()>
+    where
+        W: AsyncWrite + Send + Unpin,
+    {
         let mut this = self;
-        let mut sink = sink;
+        let sink = sink;
 
         {
             let children = std::mem::take(&mut this.root.children);
@@ -659,11 +641,11 @@ impl Builder {
                 checksum: this.checksum,
             },
         );
-        sink.as_mut().send_all(sb_area).await?;
+        sink.write_all(&sb_area).await?;
 
         // Data area.
         {
-            let s: Pin<&mut (dyn Sink<Vec<u8>, Error = io::Error> + Send)> = sink.as_mut();
+            let s: &mut (dyn AsyncWrite + Send + Unpin) = &mut *sink;
             Box::pin(write_flat_data(&this.root, s, &data_addrs, bs)).await?;
         }
 
@@ -674,55 +656,10 @@ impl Builder {
         while meta_buf.len() < meta_blocks * bs {
             meta_buf.push(0);
         }
-        sink.as_mut().send_all(meta_buf).await?;
+        sink.write_all(&meta_buf).await?;
 
-        finish_sink(sink).await
+        sink.flush().await
     }
-}
-
-async fn finish_sink<S: Sink<Vec<u8>, Error = io::Error> + ?Sized>(
-    mut sink: Pin<&mut S>,
-) -> io::Result<()> {
-    std::future::poll_fn(|cx| sink.as_mut().poll_flush(cx)).await
-}
-
-// ---- async helpers over the sans-IO sink ----
-
-trait SinkAsync: Sink<Vec<u8>, Error = io::Error> + Send {
-    fn send_all<'a>(
-        self: Pin<&'a mut Self>,
-        buf: Vec<u8>,
-    ) -> impl Future<Output = io::Result<()>> + Send + 'a {
-        let mut this = self;
-        let mut item = Some(buf);
-        async move {
-            std::future::poll_fn(|cx| this.as_mut().poll_ready(cx)).await?;
-            this.as_mut()
-                .start_send(item.take().expect("send_all polled after completion"))?;
-            std::future::poll_fn(|cx| this.as_mut().poll_flush(cx)).await
-        }
-    }
-}
-
-impl<T: Sink<Vec<u8>, Error = io::Error> + Send + ?Sized> SinkAsync for T {}
-
-/// Await a stream chunk properly inside async context.
-async fn pending_then_poll<S: Stream<Item = io::Result<Vec<u8>>> + ?Sized>(
-    stream: &mut Pin<Box<S>>,
-    buf: &mut Vec<u8>,
-) -> io::Result<()> {
-    std::future::poll_fn(|cx| match stream.as_mut().poll_next(cx) {
-        Poll::Ready(Some(chunk)) => match chunk {
-            Ok(bytes) => {
-                buf.extend_from_slice(&bytes);
-                Poll::Ready(Ok(()))
-            }
-            Err(e) => Poll::Ready(Err(e)),
-        },
-        Poll::Ready(None) => Poll::Ready(Ok(())),
-        Poll::Pending => Poll::Pending,
-    })
-    .await
 }
 
 struct SuperblockParams<'a> {
@@ -936,7 +873,7 @@ fn build_dirents(n: &Node, data_addrs: &HashMap<u64, u32>, block_size: usize) ->
 
 fn write_flat_data<'a>(
     root: &'a Node,
-    mut sink: Pin<&'a mut (dyn Sink<Vec<u8>, Error = io::Error> + Send)>,
+    sink: &'a mut (dyn AsyncWrite + Send + Unpin),
     data_addrs: &'a HashMap<u64, u32>,
     bs: usize,
 ) -> impl Future<Output = io::Result<()>> + Send + 'a {
@@ -945,25 +882,25 @@ fn write_flat_data<'a>(
             match root.file_type {
                 FileType::Dir => {
                     let buf = build_dirents(root, data_addrs, bs);
-                    sink.as_mut().send_all(buf).await?;
+                    sink.write_all(&buf).await?;
                 }
                 FileType::Symlink => {
                     let mut buf = root.link_target.clone();
                     pad_to_block(&mut buf, bs);
-                    sink.as_mut().send_all(buf).await?;
+                    sink.write_all(&buf).await?;
                 }
                 FileType::RegFile => {
                     if let Content::Inline(ref d) | Content::Drained(ref d) = root.content {
                         let mut buf = d.clone();
                         pad_to_block(&mut buf, bs);
-                        sink.as_mut().send_all(buf).await?;
+                        sink.write_all(&buf).await?;
                     }
                 }
                 _ => {}
             }
         }
         for c in &root.children {
-            Box::pin(write_flat_data(c, sink.as_mut(), data_addrs, bs)).await?;
+            Box::pin(write_flat_data(c, &mut *sink, data_addrs, bs)).await?;
         }
         Ok(())
     }
