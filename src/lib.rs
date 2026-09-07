@@ -9,7 +9,9 @@
 //! memory use.
 
 pub mod layout;
+pub mod reader;
 pub mod writer;
 
 pub use layout::{DataLayout, FileType};
+pub use reader::{Dirent, Reader, Stat};
 pub use writer::{CreateOptions, InodeMeta, Writer, DEFAULT_BLOCK_SIZE};
