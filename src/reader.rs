@@ -181,7 +181,11 @@ impl Reader {
 
     /// Streams the content of a regular file or the target of a symlink,
     /// invoking `f` per chunk. Returns the number of bytes passed.
-    pub async fn read_content(&mut self, nid: u64, f: &mut dyn FnMut(&[u8])) -> io::Result<u64> {
+    pub async fn read_content(
+        &mut self,
+        nid: u64,
+        f: &mut (dyn FnMut(&[u8]) + Send),
+    ) -> io::Result<u64> {
         let v = self.inode(nid).await?;
         if !matches!(v.kind, FileType::RegFile | FileType::Symlink) {
             return Err(bad(format!("inode {nid}: not a regular file or symlink")));
